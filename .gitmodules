@@ -1,0 +1,6 @@
+[submodule "tree-sitter-zig"]
+	path = tree-sitter-zig
+	url = git@github.com:tree-sitter-grammars/tree-sitter-zig.git
+[submodule "rune"]
+	path = rune
+	url = git@git.unstable.build:unstablebuild/rune.git

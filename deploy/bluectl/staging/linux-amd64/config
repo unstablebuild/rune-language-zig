@@ -1,0 +1,10 @@
+auth:
+    project-id: unstable-build-blue-dev
+release:
+    collection: rune-release-linux-amd64
+    bucket: rune-dev-linux-amd64
+issue:
+    collection: blue-issue
+    author: ""
+password:
+    collection: blue-secret

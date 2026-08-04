@@ -1,0 +1,10 @@
+auth:
+    project-id: rune-prod
+release:
+    collection: rune-release-linux-arm64
+    bucket: rune-release-linux-arm64
+issue:
+    collection: blue-issue
+    author: ""
+password:
+    collection: blue-secret

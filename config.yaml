@@ -1,0 +1,44 @@
+gui:
+  env:
+    # zig locates its lib/ (std, libc headers, compiler-rt) relative to its own
+    # executable, and the installer byte-copies package executables into
+    # $RUNE_DATADIR/bin, severing that link. Without this, `zig` fails in the
+    # terminal AND zls's `zig env` probe exits 1, costing std-library analysis
+    # and build-on-save. $RUNE_DATADIR/lib/$RUNE_PKG_ID is the version-
+    # independent symlink the installer maintains, so this survives upgrades.
+    ZIG_LIB_DIR: '$RUNE_DATADIR/lib/$RUNE_PKG_ID/zig/lib'
+    # Confine the shared build cache to the Rune data dir so uninstall is clean.
+    # ZIG_LOCAL_CACHE_DIR is deliberately unset: per-project .zig-cache must
+    # stay per project.
+    ZIG_GLOBAL_CACHE_DIR: '$RUNE_DATADIR/zig/cache'
+    PATH: '$RUNE_DATADIR/bin:$PATH'
+extensions:
+  zig:
+    path: '$RUNE_DATADIR/bin/extension_zig'
+    config:
+      lsp_path: ""
+      zig_path: ""
+debugger:
+  zig:
+    # Invoked by package-local path, not through $RUNE_DATADIR/bin: the shared
+    # bin copy collides with rune-language-rust's lldb-dap and its
+    # @loader_path/../lib rpath does not resolve there. Inside the package dir,
+    # bin/ and lib/ are siblings, so liblldb loads.
+    command: '$RUNE_DATADIR/lib/$RUNE_PKG_ID/bin/lldb-dap --connection listen://{addr}'
+    adapter_id: "lldb"
+    launch:
+      request: "launch"
+      type: "lldb"
+      stopOnEntry: "false"
+    attach:
+      request: "attach"
+      type: "lldb"
+editor:
+  icons:
+    .zig: 
+  comments:
+    zig:
+      line:
+        - "//"
+  indents:
+    zig: "spaces"
