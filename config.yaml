@@ -32,7 +32,7 @@ debugger:
       type: "lldb"
 editor:
   icons:
-    .zig: 
+    .zig: 
   comments:
     zig:
       line:
