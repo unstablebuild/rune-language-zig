@@ -1,12 +1,9 @@
 gui:
   env:
-    # zig locates its lib/ (std, libc headers, compiler-rt) relative to its own
-    # executable, and the installer byte-copies package executables into
-    # $RUNE_DATADIR/bin, severing that link. Without this, `zig` fails in the
-    # terminal AND zls's `zig env` probe exits 1, costing std-library analysis
-    # and build-on-save. $RUNE_DATADIR/lib/$RUNE_PKG_ID is the version-
-    # independent symlink the installer maintains, so this survives upgrades.
-    ZIG_LIB_DIR: '$RUNE_DATADIR/lib/$RUNE_PKG_ID/zig/lib'
+    # Deliberately NO ZIG_LIB_DIR: env vars leak into every zig invocation
+    # inside Rune, pinning user-provided toolchains (e.g. a dev compiler) to
+    # this package's std lib. The `zig` on PATH is a shim that runs the real
+    # compiler from inside the package dir, where it self-locates its lib/.
     # Confine the shared build cache to the Rune data dir so uninstall is clean.
     # ZIG_LOCAL_CACHE_DIR is deliberately unset: per-project .zig-cache must
     # stay per project.

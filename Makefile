@@ -80,11 +80,13 @@ default: $(TAR)
 # Stage the prebuilt zig toolchain, zls and lldb-dap for the target os/arch.
 toolchain:
 	@mkdir -p pkg/bin pkg/lib
-	# zig: the compiler resolves its lib/ (std, libc headers, compiler-rt)
-	# RELATIVE to its own executable, so the binary must ship with its sibling
-	# lib/ intact under pkg/zig/. The installer additionally byte-copies every
-	# packaged executable into $$RUNE_DATADIR/bin, and that copy is severed from
-	# lib/ -- config.yaml sets ZIG_LIB_DIR to repair it.
+	# zig: the compiler locates its lib/ (std, libc headers, compiler-rt) by
+	# walking up from its own executable path, so it must run from inside
+	# pkg/zig/ next to its lib/. The installer byte-copies every non-hidden
+	# packaged executable into $$RUNE_DATADIR/bin, which would publish a copy
+	# severed from lib/; the real binary is therefore hidden (pkg/zig/.zig,
+	# skipped by the installer) and PATH gets the zig-shim.sh wrapper instead.
+	# No ZIG_LIB_DIR is exported, so user-provided toolchains are unaffected.
 	wget -O zig.tar.xz https://ziglang.org/download/$(ZIG_VERSION)/$(ZIG_DIST).tar.xz
 	rm -rf pkg/zig && mkdir -p pkg/zig
 	tar -xJf zig.tar.xz -C pkg/zig --strip-components=1
@@ -92,7 +94,9 @@ toolchain:
 	# lib/ is data (zig sources, libc headers). Strip exec bits so the
 	# installer's flat bin-copy step does not publish lib payload onto PATH.
 	find pkg/zig/lib -type f -exec chmod a-x {} +
-	chmod +x pkg/zig/zig
+	mv pkg/zig/zig pkg/zig/.zig
+	chmod +x pkg/zig/.zig
+	install -m 0755 zig-shim.sh pkg/bin/zig
 	# zls: single static binary, no sibling data.
 	wget -O zls.tar.xz https://github.com/zigtools/zls/releases/download/$(ZLS_VERSION)/$(ZLS_DIST).tar.xz
 	rm -rf zls-extract && mkdir -p zls-extract
@@ -142,7 +146,7 @@ endif
 
 ifeq ($(UNAME),Darwin)
 sign: $(LIB)
-	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/zig/zig
+	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/zig/.zig
 	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/bin/zls
 	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/bin/extension_zig
 	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/lib/tree-sitter.so
@@ -153,7 +157,7 @@ sign: $(LIB)
 	done
 
 $(NOTARIZE_ZIP): sign
-	zip $(NOTARIZE_ZIP) pkg/zig/zig pkg/bin/zls pkg/bin/extension_zig pkg/lib/tree-sitter.so
+	zip $(NOTARIZE_ZIP) pkg/zig/.zig pkg/bin/zls pkg/bin/extension_zig pkg/lib/tree-sitter.so
 	@for f in pkg/bin/lldb-dap pkg/lib/liblldb*.dylib; do \
 		[ -f "$$f" ] && zip $(NOTARIZE_ZIP) "$$f" || true; \
 	done

@@ -19,25 +19,32 @@ cross-built (`TARGET_ARCH=amd64`).
 ```
 pkg/
   config.yaml
-  zig/{zig, lib/**}          # compiler + its 225MB lib (std, libc, compiler-rt)
-  bin/{zls, extension_zig, lldb-dap}
+  zig/{.zig, lib/**}         # compiler (hidden) + its 225MB lib (std, libc, compiler-rt)
+  bin/{zig, zls, extension_zig, lldb-dap}   # zig is the zig-shim.sh wrapper
   lib/{tree-sitter.so, highlights.scm, indents.scm, folds.scm, locals.scm}
   lib/liblldb.*              # absent on darwin-amd64
 ```
 
 Three non-obvious invariants, all consequences of how the installer publishes a
 package: it symlinks the version dir at `$RUNE_DATADIR/lib/<pkg-id>` and
-**byte-copies every executable** it finds, by base name, into the shared
+**byte-copies every non-hidden executable** it finds, by base name, into the shared
 `$RUNE_DATADIR/bin`.
 
-1. **`zig` ships only under `pkg/zig/`, never `pkg/bin/`.** The installer's
-   flat copy produces `$RUNE_DATADIR/bin/zig` for free, so a second copy would
-   add 185MB for nothing.
-2. **`ZIG_LIB_DIR` is mandatory** (`config.yaml`). zig finds its `lib/`
-   relative to its own executable, and the shared-bin copy is severed from it:
-   `zig env` then exits 1, which also costs zls its std-library analysis and
-   build-on-save. The `lib/` payload is stripped of exec bits at build time so
-   the flat copy does not publish data files onto `PATH`.
+1. **The real compiler is hidden (`pkg/zig/.zig`); PATH gets a shim.** zig
+   locates its `lib/` by walking up from its own executable path, so it must
+   run from inside the package dir next to `lib/`. A non-hidden compiler
+   anywhere in the package would be flat-copied into `$RUNE_DATADIR/bin` as a
+   severed, non-functional copy — hidden files are skipped, so only the
+   `zig-shim.sh` wrapper (staged as `pkg/bin/zig`) reaches `PATH`. It execs
+   the hidden binary from either of its two install locations. The `lib/`
+   payload is stripped of exec bits at build time for the same reason.
+2. **No `ZIG_LIB_DIR` (or any zig env var beyond the cache dir).** `gui.env`
+   leaks into every zig invocation inside Rune, so the var would pin
+   user-provided toolchains (e.g. a dev compiler for ziglings) to this
+   package's 0.16 std lib, failing with errors like
+   `failed to check cache: ... lib/compiler/... FileNotFound`. zls needs
+   nothing either: it resolves the lib dir by spawning `zig env`, which
+   answers correctly through the shim.
 3. **`lldb-dap` is invoked by package-local path**
    (`$RUNE_DATADIR/lib/$RUNE_PKG_ID/bin/lldb-dap`), not through the shared bin.
    rune-language-rust ships the same binary name, so the shared copy is
@@ -46,7 +53,8 @@ package: it symlinks the version dir at `$RUNE_DATADIR/lib/<pkg-id>` and
    where `bin/` and `lib/` are siblings. Keep `LLVM_VERSION` in sync with
    rune-language-rust so the colliding copy stays byte-identical.
 
-`scripts/test.sh` pins invariants 1-3 against the built tarball.
+`scripts/test.sh` pins invariants 1-3 against the built tarball, including a
+real `zig build` through the shim from a simulated `$RUNE_DATADIR`.
 
 ## Versioning
 

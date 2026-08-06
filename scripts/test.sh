@@ -8,12 +8,16 @@
 #   2. No .go source files leak into the notarization zip ($NOTARIZE_ZIP),
 #      which is submitted to Apple and must contain only signed binaries.
 #   3. The zig lib/ payload actually shipped (zig is useless without it).
-#   4. A COPY of the zig binary, detached from its sibling lib/, works when
-#      ZIG_LIB_DIR points at the packaged lib/. This is the packaging
-#      regression test for config.yaml's ZIG_LIB_DIR: the installer copies
-#      executables into $RUNE_DATADIR/bin, which severs zig from its lib/.
+#   4. The real compiler is hidden (zig/.zig) so the installer's flat bin-copy
+#      cannot publish a copy severed from lib/, and the bin/zig shim runs it
+#      from both install locations: the package's own bin/ and the shared
+#      $RUNE_DATADIR/bin (simulated with a fake data dir + lib/zig symlink).
+#      A real `zig build` must succeed through the shared-location shim.
 #   5. zls matches $ZLS_VERSION and shares zig's major.minor, since zls
 #      hard-fails against a mismatched zig at runtime.
+#   6. config.yaml exports no ZIG_LIB_DIR: gui.env leaks into every zig run
+#      inside Rune, and the env var would pin user-provided toolchains (e.g. a
+#      dev compiler) to this package's std lib.
 set -euo pipefail
 
 TAR="${TAR:-zig.tar.gz}"
@@ -57,7 +61,7 @@ if [ -f "$NOTARIZE_ZIP" ]; then
 	echo "ok: no .go files in $NOTARIZE_ZIP"
 fi
 
-for want in ./zig/zig ./zig/lib/std/std.zig ./bin/zls ./bin/extension_zig \
+for want in ./zig/.zig ./zig/lib/std/std.zig ./bin/zig ./bin/zls ./bin/extension_zig \
 	./lib/tree-sitter.so ./lib/highlights.scm ./config.yaml; do
 	if ! grep -qxF "$want" "$members"; then
 		echo "error: $TAR is missing $want" >&2
@@ -66,23 +70,34 @@ for want in ./zig/zig ./zig/lib/std/std.zig ./bin/zls ./bin/extension_zig \
 done
 echo "ok: zig toolchain, zls, extension and grammar payload present in $TAR"
 
-tar -xzf "$TAR" -C "$workdir"
-
-# Reproduce what the installer does: copy the binary out of the package, away
-# from its sibling lib/, and drive it through ZIG_LIB_DIR.
-mkdir -p "$workdir/detached"
-cp "$workdir/zig/zig" "$workdir/detached/zig"
-lib_dir="$workdir/zig/lib"
-
-# A detached zig with no ZIG_LIB_DIR must fail; if this ever starts passing,
-# the env var in config.yaml has become unnecessary.
-if "$workdir/detached/zig" env > /dev/null 2>&1; then
-	echo "error: detached zig unexpectedly found a lib dir without ZIG_LIB_DIR" >&2
+# The real compiler must ship hidden-only: a non-hidden executable named zig
+# outside bin/ would be flat-copied over the shim in $RUNE_DATADIR/bin.
+if grep -qxF ./zig/zig "$members"; then
+	echo "error: $TAR ships a non-hidden ./zig/zig; the installer would publish it over the shim" >&2
 	exit 1
 fi
 
-if ! ZIG_LIB_DIR="$lib_dir" "$workdir/detached/zig" env > "$workdir/zig-env.zon"; then
-	echo "error: detached zig failed with ZIG_LIB_DIR=$lib_dir" >&2
+tar -xzf "$TAR" -C "$workdir"
+
+if grep -qE '^[[:space:]]*ZIG_LIB_DIR' "$workdir/config.yaml"; then
+	echo "error: packaged config.yaml sets ZIG_LIB_DIR; it leaks into user-provided zig toolchains" >&2
+	exit 1
+fi
+echo "ok: no ZIG_LIB_DIR exported"
+
+lib_dir="$workdir/zig/lib"
+
+# Reproduce the installed layout: the shim is flat-copied into a shared bin
+# dir, and lib/zig symlinks the package root (the installer's lib/<pkg-id>
+# convention). The shim must find the hidden compiler through that symlink.
+fdd="$workdir/fakedatadir"
+mkdir -p "$fdd/bin" "$fdd/lib"
+cp "$workdir/bin/zig" "$fdd/bin/zig"
+ln -s "$workdir" "$fdd/lib/zig"
+
+if ! "$fdd/bin/zig" env > "$workdir/zig-env.zon" 2>&1; then
+	echo "error: shim in shared bin failed to run the packaged compiler:" >&2
+	cat "$workdir/zig-env.zon" >&2
 	exit 1
 fi
 # `zig env` prints ZON and reports lib_dir relative to the cwd when that is
@@ -90,13 +105,24 @@ fi
 reported="$(sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p' "$workdir/zig-env.zon")"
 if [ -z "$reported" ] ||
 	[ "$(cd "$reported" 2>/dev/null && pwd -P)" != "$(cd "$lib_dir" && pwd -P)" ]; then
-	echo "error: 'zig env' did not report lib_dir=$lib_dir:" >&2
+	echo "error: shim-run zig did not resolve lib_dir=$lib_dir:" >&2
 	cat "$workdir/zig-env.zon" >&2
 	exit 1
 fi
-echo "ok: detached zig resolves its lib dir through ZIG_LIB_DIR"
+echo "ok: shared-bin shim resolves the packaged lib dir with no ZIG_LIB_DIR"
 
-zig_version="$(ZIG_LIB_DIR="$lib_dir" "$workdir/detached/zig" version)"
+# End-to-end: a real project builds and runs through the shared-location shim.
+mkdir -p "$workdir/proj"
+(
+	cd "$workdir/proj"
+	ZIG_GLOBAL_CACHE_DIR="$workdir/zig-cache" "$fdd/bin/zig" init > /dev/null 2>&1
+	ZIG_GLOBAL_CACHE_DIR="$workdir/zig-cache" "$fdd/bin/zig" build
+	./zig-out/bin/proj > /dev/null 2>&1 || true
+)
+echo "ok: zig build succeeds through the shim"
+
+# Package-local invocation (<pkg>/bin/zig), the shim's other install location.
+zig_version="$("$workdir/bin/zig" version)"
 if [ -n "$ZIG_VERSION" ] && [ "$zig_version" != "$ZIG_VERSION" ]; then
 	echo "error: packaged zig is $zig_version, expected $ZIG_VERSION" >&2
 	exit 1
