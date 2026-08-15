@@ -1,5 +1,10 @@
 SRC=tree-sitter-zig rune
-LIB=$(wildcard pkg/**/*) $(wildcard pkg/*) pkg
+# Stamp files (not phony) so repeated `make` invocations - including the
+# separate `make` sub-processes spawned by dist-% - can skip re-downloading
+# the toolchain / rebuilding the extension when nothing changed. `make
+# clean` removes pkg/, which removes these stamps and forces a full redo.
+TOOLCHAIN_STAMP=pkg/.toolchain-stamp
+BUILD_STAMP=pkg/.build-stamp
 TAR=zig.tar.gz
 NOTARIZE_ZIP=zig-notarize.zip
 CODESIGN_IDENTITY=Developer ID Application: Unstable Build, LLC. (YYZRWD888J)
@@ -78,7 +83,9 @@ DIST_TARGETS := \
 default: $(TAR)
 
 # Stage the prebuilt zig toolchain, zls and lldb-dap for the target os/arch.
-toolchain:
+toolchain: $(TOOLCHAIN_STAMP)
+
+$(TOOLCHAIN_STAMP):
 	@mkdir -p pkg/bin pkg/lib
 	# zig: the compiler locates its lib/ (std, libc headers, compiler-rt) by
 	# walking up from its own executable path, so it must run from inside
@@ -125,8 +132,9 @@ toolchain:
 		chmod +x pkg/bin/lldb-dap; \
 		rm -rf llvm.tar.xz llvm-extract; \
 	fi
+	@touch $@
 
-$(LIB): $(SRC) toolchain
+$(BUILD_STAMP): $(SRC) $(TOOLCHAIN_STAMP)
 	@mkdir -p pkg/bin pkg/lib
 ifeq ($(HOST_OS),darwin)
 	cd tree-sitter-zig && cc -o parser.so -I./src src/*.c -Os -bundle -arch arm64 -arch x86_64
@@ -143,9 +151,10 @@ endif
 	cd rune && CGO_ENABLED=1 CC="$(EXT_CC)" GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) \
 		go build -o $(PWD)/pkg/bin/extension_zig ./cmd/extension_zig
 	cp config.yaml pkg
+	@touch $@
 
 ifeq ($(UNAME),Darwin)
-sign: $(LIB)
+sign: $(BUILD_STAMP)
 	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/zig/.zig
 	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/bin/zls
 	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/bin/extension_zig
@@ -165,14 +174,14 @@ $(NOTARIZE_ZIP): sign
 notarize: $(NOTARIZE_ZIP)
 	xcrun notarytool submit $(NOTARIZE_ZIP) --keychain-profile "$(NOTARY_PROFILE)" --wait
 else
-sign: $(LIB)
+sign: $(BUILD_STAMP)
 	@echo "Skipping codesign (not on macOS)"
 
 notarize: sign
 	@echo "Skipping notarization (not on macOS)"
 endif
 
-$(TAR): $(LIB) sign
+$(TAR): $(BUILD_STAMP) sign
 	cd pkg && $(GTAR) --no-xattrs --no-acls -czf ../$(TAR) .
 
 # Verify release-tarball properties (no .go source leaks, zig lib payload, etc).
@@ -189,8 +198,7 @@ $(DIST_TARGETS): dist-%: check-release-tag
 	   exit 1; \
 	 fi; \
 	 $(MAKE) clean; \
-	 $(MAKE) notarize $(TAR) TARGET_ARCH=$$arch; \
-	 $(MAKE) test TARGET_ARCH=$$arch; \
+	 $(MAKE) notarize $(TAR) test TARGET_ARCH=$$arch; \
 	 BLUECTL_CONFIG_DIR=$(BLUECTL_CONFIG_ROOT)/$$env/$$os-$$arch \
 	 BLUE_TARGET_OS=$$os BLUE_TARGET_ARCH=$$arch ./dist.sh
 
