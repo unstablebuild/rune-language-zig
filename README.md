@@ -4,6 +4,14 @@ Rune language package for Zig: the `zig` toolchain, `zls`, `extension_zig`,
 the tree-sitter grammar and `lldb-dap`, shipped as one signed tarball
 published to the `zig` package id.
 
+To install Zig support in Rune, run this command in the Rune console:
+
+```text
+pkg install zig
+```
+
+The release instructions below are for Rune maintainers.
+
 ## Release runbook
 
 1. **Prepare the build host.** Build macOS (`darwin`) artifacts on macOS and
@@ -78,9 +86,3 @@ package: it symlinks the version dir at `$RUNE_DATADIR/lib/<pkg-id>` and
 
 `scripts/test.sh` pins invariants 1-3 against the built tarball, including a
 real `zig build` through the shim from a simulated `$RUNE_DATADIR`.
-
-## Versioning
-
-This package supersedes the grammar-only `zig` package published from
-rune-language-template (`v0.0.9-1-g58ab44c`), so the first release tag must sort
-above it: start at `v0.0.10`.
