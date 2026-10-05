@@ -1,217 +1,189 @@
-SRC=tree-sitter-zig rune
-# Stamp files (not phony) so repeated `make` invocations - including the
-# separate `make` sub-processes spawned by dist-% - can skip re-downloading
-# the toolchain / rebuilding the extension when nothing changed. `make
-# clean` removes pkg/, which removes these stamps and forces a full redo.
-TOOLCHAIN_STAMP=pkg/.toolchain-stamp
-BUILD_STAMP=pkg/.build-stamp
-TAR=zig.tar.gz
-NOTARIZE_ZIP=zig-notarize.zip
-CODESIGN_IDENTITY=Developer ID Application: Unstable Build, LLC. (YYZRWD888J)
-NOTARY_PROFILE=notary-profile
-UNAME=$(shell uname)
+# Release packaging for the Rune zig package. See README.md for the runbook.
+#
+# One host builds every platform: extension_zig is pure Go (CGO_ENABLED=0),
+# the grammar is compiled by `zig cc` for Linux and Apple cc for macOS, and
+# everything else is a prebuilt download. macOS packages need Apple cc (and
+# otool for the tests), so they must be built on macOS.
+#
+# Nothing is codesigned or notarized: Rune downloads packages without the
+# quarantine attribute, so Gatekeeper never assesses them. arm64 binaries only
+# need the ad-hoc signature their linkers already embed (checked by the tests).
 
-# GNU tar is named "gtar" on macOS (Homebrew) but is the default "tar" on Linux.
-ifeq ($(UNAME),Darwin)
-GTAR=gtar
-else
-GTAR=tar
-endif
-
-# Pinned prebuilt toolchain versions (downloaded per target os/arch). Zig needs
-# no bootstrap step: the compiler, zls and lldb-dap are all prebuilt downloads.
 ZIG_VERSION=0.16.0
 # zls refuses to serve a zig whose major.minor differs, so these move together.
 ZLS_VERSION=0.16.0
 # lldb-dap is extracted from the official prebuilt LLVM release. Keep this in
 # sync with rune-language-rust: both packages copy a `lldb-dap` into the shared
 # $RUNE_DATADIR/bin, and identical versions make that collision a no-op.
-# macOS x86_64 prebuilts stopped at LLVM 19, so darwin-amd64 is skipped.
 LLVM_VERSION=22.1.8
 
-HOST_OS=$(shell uname | tr '[:upper:]' '[:lower:]')
-HOST_ARCH=$(shell uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/')
-TARGET_OS=$(HOST_OS)
+# Platform floors from docs.rune.build; scripts/test.sh enforces them.
+MACOS_MIN=13.3
+GLIBC_MIN=2.28
+
+PLATFORMS=darwin-arm64 darwin-amd64 linux-arm64 linux-amd64
+ENVS=prod staging
+
+HOST_OS:=$(shell uname | tr '[:upper:]' '[:lower:]')
+HOST_ARCH:=$(shell uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/')
+TARGET_OS?=$(HOST_OS)
 TARGET_ARCH?=$(HOST_ARCH)
+PLATFORM=$(TARGET_OS)-$(TARGET_ARCH)
 
-CROSS=$(filter-out $(HOST_ARCH),$(TARGET_ARCH))
-CGO_ENABLED=$(if $(CROSS),0,1)
-
-GNU_TRIPLE_amd64=x86_64-linux-gnu
-GNU_TRIPLE_arm64=aarch64-linux-gnu
-CC=$(if $(CROSS),$(GNU_TRIPLE_$(TARGET_ARCH))-gcc,gcc)
-
-# extension_zig imports ide/syntax and go-tree-sitter, so it must build with
-# CGO enabled even for cross-arch releases. clang cross-compiles natively on
-# macOS via -arch; Linux needs the matching GNU cross toolchain.
-CLANG_ARCH_amd64=x86_64
-CLANG_ARCH_arm64=arm64
-ifeq ($(HOST_OS),darwin)
-EXT_CC=clang $(if $(CROSS),-arch $(CLANG_ARCH_$(TARGET_ARCH)),)
-else
-EXT_CC=$(CC)
+ifeq ($(filter $(PLATFORM),$(PLATFORMS)),)
+$(error unsupported platform '$(PLATFORM)'; expected one of: $(PLATFORMS))
+endif
+ifeq ($(TARGET_OS)-$(HOST_OS),darwin-linux)
+$(error $(PLATFORM) packages must be built on macOS)
 endif
 
-# Zig release asset naming: zig-<arch>-<os>-<version>.tar.xz
+BUILD=build/$(PLATFORM)
+PKG=$(BUILD)/pkg
+TAR=$(BUILD)/zig.tar.gz
+TOOLCHAIN_STAMP=$(BUILD)/.toolchain-stamp
+# Download cache. It survives `make clean`; file names carry the version.
+DL=downloads
+
+# GNU tar is named "gtar" on macOS (Homebrew) but is the default "tar" on Linux.
+ifeq ($(HOST_OS),darwin)
+GTAR=gtar
+else
+GTAR=tar
+endif
+
+# zig and zls release assets are named after zig's <arch>-<os> pair.
 ZIG_ARCH_amd64=x86_64
 ZIG_ARCH_arm64=aarch64
-ZIG_ARCH=$(ZIG_ARCH_$(TARGET_ARCH))
 ZIG_OS_darwin=macos
 ZIG_OS_linux=linux
-ZIG_OS=$(ZIG_OS_$(TARGET_OS))
-ZIG_DIST=zig-$(ZIG_ARCH)-$(ZIG_OS)-$(ZIG_VERSION)
-# zls release asset naming: zls-<arch>-<os>.tar.xz
-ZLS_DIST=zls-$(ZIG_ARCH)-$(ZIG_OS)
+ZIG_TRIPLE=$(ZIG_ARCH_$(TARGET_ARCH))-$(ZIG_OS_$(TARGET_OS))
+ZIG_TARBALL=$(DL)/zig-$(ZIG_TRIPLE)-$(ZIG_VERSION).tar.xz
+ZLS_TARBALL=$(DL)/zls-$(ZIG_TRIPLE)-$(ZLS_VERSION).tar.xz
 
-# LLVM release asset naming (different per OS).
-LLVM_ARCH_amd64_linux=X64
-LLVM_ARCH_arm64_linux=ARM64
-LLVM_ARCH_arm64_darwin=ARM64
-LLVM_OSNAME_darwin=macOS
-LLVM_OSNAME_linux=Linux
-LLVM_ASSET=LLVM-$(LLVM_VERSION)-$(LLVM_OSNAME_$(TARGET_OS))-$(LLVM_ARCH_$(TARGET_ARCH)_$(TARGET_OS)).tar.xz
+# LLVM release assets: LLVM-<version>-<Linux|macOS>-<X64|ARM64>.tar.xz. macOS
+# x86_64 prebuilts stopped at LLVM 19, so darwin-amd64 ships without lldb-dap.
+LLVM_OS_darwin=macOS
+LLVM_OS_linux=Linux
+LLVM_ARCH_amd64=X64
+LLVM_ARCH_arm64=ARM64
+LLVM_ASSET=LLVM-$(LLVM_VERSION)-$(LLVM_OS_$(TARGET_OS))-$(LLVM_ARCH_$(TARGET_ARCH)).tar.xz
+LLDB_DAP=$(filter-out darwin-amd64,$(PLATFORM))
 
-BLUECTL_CONFIG_ROOT := $(abspath deploy/bluectl)
+# The host's own zig compiles the grammar for Linux: `zig cc` cross-compiles
+# against a pinned glibc, so no target toolchain or sysroot is needed.
+HOST_ZIG_DIR=$(DL)/zig-$(ZIG_ARCH_$(HOST_ARCH))-$(ZIG_OS_$(HOST_OS))-$(ZIG_VERSION)
+HOST_ZIG=$(HOST_ZIG_DIR)/zig
 
-DIST_TARGETS := \
-	dist-prod-darwin-arm64 dist-prod-darwin-amd64 \
-	dist-prod-linux-arm64  dist-prod-linux-amd64  \
-	dist-staging-darwin-arm64 dist-staging-darwin-amd64 \
-	dist-staging-linux-arm64  dist-staging-linux-amd64
+CLANG_ARCH_amd64=x86_64
+CLANG_ARCH_arm64=arm64
+ifeq ($(TARGET_OS),darwin)
+PARSER_CC=cc -arch $(CLANG_ARCH_$(TARGET_ARCH)) -mmacosx-version-min=$(MACOS_MIN) -bundle
+else
+PARSER_CC=$(HOST_ZIG) cc -target $(ZIG_ARCH_$(TARGET_ARCH))-linux-gnu.$(GLIBC_MIN) -shared -fPIC
+endif
 
-.PHONY: $(DIST_TARGETS) clean sign notarize notary-credentials toolchain test
+# $(call fetch,<url>,<file>): download <url> to <file> unless it is cached.
+fetch=mkdir -p $(DL) && { [ -f $2 ] || { wget -O $2.part $1 && mv $2.part $2; }; }
+
+RELEASE_TARGETS=$(addprefix release-,$(PLATFORMS))
+DIST_TARGETS=$(foreach e,$(ENVS),$(foreach p,$(PLATFORMS),dist-$e-$p))
+DIST_ALL_TARGETS=$(addprefix dist-,$(addsuffix -all,$(ENVS)))
+
+.PHONY: default package test clean distclean \
+	check-dist release-all $(RELEASE_TARGETS) $(DIST_TARGETS) $(DIST_ALL_TARGETS)
+
 default: $(TAR)
 
-# Stage the prebuilt zig toolchain, zls and lldb-dap for the target os/arch.
-toolchain: $(TOOLCHAIN_STAMP)
-
-$(TOOLCHAIN_STAMP):
-	@mkdir -p pkg/bin pkg/lib
+# Stage the prebuilt zig toolchain, zls and lldb-dap into the package.
+$(TOOLCHAIN_STAMP): Makefile zig-shim.sh
+	$(call fetch,https://ziglang.org/download/$(ZIG_VERSION)/zig-$(ZIG_TRIPLE)-$(ZIG_VERSION).tar.xz,$(ZIG_TARBALL))
+	$(call fetch,https://github.com/zigtools/zls/releases/download/$(ZLS_VERSION)/zls-$(ZIG_TRIPLE).tar.xz,$(ZLS_TARBALL))
+	rm -rf $(PKG) && mkdir -p $(PKG)/bin $(PKG)/lib $(PKG)/zig
 	# zig: the compiler locates its lib/ (std, libc headers, compiler-rt) by
 	# walking up from its own executable path, so it must run from inside
-	# pkg/zig/ next to its lib/. The installer byte-copies every non-hidden
+	# zig/ next to its lib/. The installer byte-copies every non-hidden
 	# packaged executable into $$RUNE_DATADIR/bin, which would publish a copy
-	# severed from lib/; the real binary is therefore hidden (pkg/zig/.zig,
+	# severed from lib/; the real binary is therefore hidden (zig/.zig,
 	# skipped by the installer) and PATH gets the zig-shim.sh wrapper instead.
 	# No ZIG_LIB_DIR is exported, so user-provided toolchains are unaffected.
-	wget -O zig.tar.xz https://ziglang.org/download/$(ZIG_VERSION)/$(ZIG_DIST).tar.xz
-	rm -rf pkg/zig && mkdir -p pkg/zig
-	tar -xJf zig.tar.xz -C pkg/zig --strip-components=1
-	rm -rf zig.tar.xz pkg/zig/doc
+	$(GTAR) -xJf $(ZIG_TARBALL) -C $(PKG)/zig --strip-components=1
+	rm -rf $(PKG)/zig/doc
 	# lib/ is data (zig sources, libc headers). Strip exec bits so the
 	# installer's flat bin-copy step does not publish lib payload onto PATH.
-	find pkg/zig/lib -type f -exec chmod a-x {} +
-	mv pkg/zig/zig pkg/zig/.zig
-	chmod +x pkg/zig/.zig
-	install -m 0755 zig-shim.sh pkg/bin/zig
+	find $(PKG)/zig/lib -type f -exec chmod a-x {} +
+	mv $(PKG)/zig/zig $(PKG)/zig/.zig
+	install -m 0755 zig-shim.sh $(PKG)/bin/zig
 	# zls: single static binary, no sibling data.
-	wget -O zls.tar.xz https://github.com/zigtools/zls/releases/download/$(ZLS_VERSION)/$(ZLS_DIST).tar.xz
-	rm -rf zls-extract && mkdir -p zls-extract
-	tar -xJf zls.tar.xz -C zls-extract
-	cp zls-extract/zls pkg/bin/zls
-	chmod +x pkg/bin/zls
-	rm -rf zls.tar.xz zls-extract
+	$(GTAR) -xJf $(ZLS_TARBALL) -C $(PKG)/bin zls
+ifneq ($(LLDB_DAP),)
 	# lldb-dap: extract only bin/lldb-dap + the liblldb shared lib it links
-	# from the ~1.5GB prebuilt LLVM tarball; never the build-time static .a
-	# archives. lldb-dap's rpath is @loader_path/../lib, which resolves inside
-	# the installed package dir (bin/ + lib/ siblings) -- config.yaml therefore
-	# invokes it by its package-local path, not through $$RUNE_DATADIR/bin.
-	@if [ "$(TARGET_OS)-$(TARGET_ARCH)" = "darwin-amd64" ]; then \
-		echo "skip lldb-dap: no official macOS-amd64 LLVM $(LLVM_VERSION) prebuilt"; \
-	else \
-		wget -O llvm.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-$(LLVM_VERSION)/$(LLVM_ASSET); \
-		mkdir -p llvm-extract; \
-		tar -xJf llvm.tar.xz -C llvm-extract --strip-components=1 '*/bin/lldb-dap'; \
-		tar -xJf llvm.tar.xz -C llvm-extract --strip-components=1 '*/lib/liblldb.*dylib' 2>/dev/null || true; \
-		tar -xJf llvm.tar.xz -C llvm-extract --strip-components=1 '*/lib/liblldb.so*'   2>/dev/null || true; \
-		tar -xJf llvm.tar.xz -C llvm-extract --strip-components=1 '*/lib/libLLVM.so*'   2>/dev/null || true; \
-		cp llvm-extract/bin/lldb-dap pkg/bin/lldb-dap; \
-		cp -a llvm-extract/lib/liblldb.*dylib pkg/lib/ 2>/dev/null || true; \
-		cp -a llvm-extract/lib/liblldb.so* pkg/lib/ 2>/dev/null || true; \
-		cp -a llvm-extract/lib/libLLVM.so* pkg/lib/ 2>/dev/null || true; \
-		chmod +x pkg/bin/lldb-dap; \
-		rm -rf llvm.tar.xz llvm-extract; \
-	fi
-	@touch $@
-
-$(BUILD_STAMP): $(SRC) $(TOOLCHAIN_STAMP)
-	@mkdir -p pkg/bin pkg/lib
-ifeq ($(HOST_OS),darwin)
-	cd tree-sitter-zig && cc -o parser.so -I./src src/*.c -Os -bundle -arch arm64 -arch x86_64
-else
-	cd tree-sitter-zig && $(CC) -o parser.so -I./src src/*.c -Os -shared -fPIC
+	# from the ~1.5GB prebuilt LLVM tarball. Its rpath is @loader_path/../lib
+	# ($$ORIGIN/../lib on Linux), which resolves inside the installed package
+	# dir (bin/ + lib/ siblings) -- config.yaml therefore invokes it by its
+	# package-local path, not through $$RUNE_DATADIR/bin.
+	$(call fetch,https://github.com/llvm/llvm-project/releases/download/llvmorg-$(LLVM_VERSION)/$(LLVM_ASSET),$(DL)/$(LLVM_ASSET))
+	$(GTAR) -xJf $(DL)/$(LLVM_ASSET) -C $(PKG) --strip-components=1 --wildcards \
+		'*/bin/lldb-dap' '*/lib/liblldb.*'
 endif
-	cp tree-sitter-zig/parser.so pkg/lib/tree-sitter.so
+	touch $@
+
+$(HOST_ZIG):
+	$(call fetch,https://ziglang.org/download/$(ZIG_VERSION)/$(notdir $(HOST_ZIG_DIR)).tar.xz,$(HOST_ZIG_DIR).tar.xz)
+	$(GTAR) -xJf $(HOST_ZIG_DIR).tar.xz -C $(DL)
+
+# Build the grammar and extension_zig into the staged package. They are
+# rebuilt on every run: both are quick, and a stale binary must never ship.
+package: $(TOOLCHAIN_STAMP) $(if $(filter linux,$(TARGET_OS)),$(HOST_ZIG))
+	$(PARSER_CC) -Os -I tree-sitter-zig/src tree-sitter-zig/src/*.c -o $(PKG)/lib/tree-sitter.so
 	# All four query kinds come from the grammar repo with no inherits chain,
-	# matching the fixtures under rune/ide/syntax/syntaxtest/zig.
-	cp tree-sitter-zig/queries/highlights.scm pkg/lib
-	cp tree-sitter-zig/queries/indents.scm pkg/lib
-	cp tree-sitter-zig/queries/locals.scm pkg/lib
-	cp tree-sitter-zig/queries/folds.scm pkg/lib
-	cd rune && CGO_ENABLED=1 CC="$(EXT_CC)" GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) \
-		go build -o $(PWD)/pkg/bin/extension_zig ./cmd/extension_zig
-	cp config.yaml pkg
-	@touch $@
+	# matching the fixtures under rune/internal/ide/syntax/syntaxtest.
+	cp tree-sitter-zig/queries/highlights.scm tree-sitter-zig/queries/indents.scm \
+		tree-sitter-zig/queries/locals.scm tree-sitter-zig/queries/folds.scm $(PKG)/lib
+	cd rune && CGO_ENABLED=0 GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) \
+		go build -o $(CURDIR)/$(PKG)/bin/extension_zig ./cmd/extension_zig
+	cp config.yaml $(PKG)
 
-ifeq ($(UNAME),Darwin)
-sign: $(BUILD_STAMP)
-	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/zig/.zig
-	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/bin/zls
-	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/bin/extension_zig
-	codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" pkg/lib/tree-sitter.so
-	# lldb-dap + liblldb are absent for darwin-amd64 (no prebuilt LLVM); sign the
-	# dylib before the binary so the binary's rpath ref stays valid.
-	@for f in pkg/lib/liblldb*.dylib pkg/bin/lldb-dap; do \
-		[ -f "$$f" ] && codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" "$$f" || true; \
-	done
+$(TAR): package
+	cd $(PKG) && $(GTAR) --no-xattrs --no-acls -czf $(CURDIR)/$@ .
 
-$(NOTARIZE_ZIP): sign
-	zip $(NOTARIZE_ZIP) pkg/zig/.zig pkg/bin/zls pkg/bin/extension_zig pkg/lib/tree-sitter.so
-	@for f in pkg/bin/lldb-dap pkg/lib/liblldb*.dylib; do \
-		[ -f "$$f" ] && zip $(NOTARIZE_ZIP) "$$f" || true; \
-	done
-
-notarize: $(NOTARIZE_ZIP)
-	xcrun notarytool submit $(NOTARIZE_ZIP) --keychain-profile "$(NOTARY_PROFILE)" --wait
-else
-sign: $(BUILD_STAMP)
-	@echo "Skipping codesign (not on macOS)"
-
-notarize: sign
-	@echo "Skipping notarization (not on macOS)"
-endif
-
-$(TAR): $(BUILD_STAMP) sign
-	cd pkg && $(GTAR) --no-xattrs --no-acls -czf ../$(TAR) .
-
-# Verify release-tarball properties (no .go source leaks, zig lib payload, etc).
+# Verify the tarball (see scripts/test.sh). Binaries only run when the target
+# is the host platform; every other check applies to all platforms.
 test: $(TAR)
-	TAR=$(TAR) NOTARIZE_ZIP=$(NOTARIZE_ZIP) ZIG_VERSION=$(ZIG_VERSION) \
-		ZLS_VERSION=$(ZLS_VERSION) ./scripts/test.sh
+	TAR=$(TAR) TARGET_OS=$(TARGET_OS) TARGET_ARCH=$(TARGET_ARCH) \
+		ZIG_VERSION=$(ZIG_VERSION) ZLS_VERSION=$(ZLS_VERSION) \
+		MACOS_MIN=$(MACOS_MIN) GLIBC_MIN=$(GLIBC_MIN) \
+		RUN_BINARIES=$(if $(filter $(HOST_OS)-$(HOST_ARCH),$(PLATFORM)),1,0) \
+		./scripts/test.sh
 
-$(DIST_TARGETS): dist-%: check-release-tag
-	@env=$$(echo $* | cut -d- -f1); \
-	 os=$$(echo $*  | cut -d- -f2); \
-	 arch=$$(echo $* | cut -d- -f3); \
-	 if [ "$$os" != "$(HOST_OS)" ]; then \
-	   echo "error: $@ targets OS '$$os' but host OS is '$(HOST_OS)'; build $$os releases on a $$os machine" >&2; \
-	   exit 1; \
-	 fi; \
-	 $(MAKE) clean; \
-	 $(MAKE) notarize $(TAR) test TARGET_ARCH=$$arch; \
-	 BLUECTL_CONFIG_DIR=$(BLUECTL_CONFIG_ROOT)/$$env/$$os-$$arch \
-	 BLUE_TARGET_OS=$$os BLUE_TARGET_ARCH=$$arch ./dist.sh
+# release-<os>-<arch>: build one platform from scratch and test it. This is
+# dist-* without the upload.
+$(RELEASE_TARGETS): release-%:
+	rm -rf build/$*
+	$(MAKE) test TARGET_OS=$(word 1,$(subst -, ,$*)) TARGET_ARCH=$(word 2,$(subst -, ,$*))
 
-.PHONY: check-release-tag
-check-release-tag:
+release-all:
+	for p in $(PLATFORMS); do $(MAKE) release-$$p || exit 1; done
+
+# dist-<env>-<os>-<arch>: release one platform and upload it to <env>.
+$(DIST_TARGETS): dist-%: check-dist
+	$(MAKE) release-$(word 2,$(subst -, ,$*))-$(word 3,$(subst -, ,$*))
+	./dist.sh $(subst -, ,$*)
+
+# dist-<env>-all: release all four platforms, then upload them. Nothing is
+# uploaded unless every platform builds and passes its tests.
+$(DIST_ALL_TARGETS): dist-%-all: check-dist
+	$(MAKE) release-all
+	for p in $(PLATFORMS); do ./dist.sh $* $${p%-*} $${p#*-} || exit 1; done
+
+# Fail before any build work if the release cannot be uploaded.
+check-dist:
 	./check-release-tag.sh
-
-notary-credentials:
-	xcrun notarytool store-credentials "$(NOTARY_PROFILE)" --team-id "YYZRWD888J"
+	@command -v bluectl >/dev/null || { echo "error: bluectl is not on PATH" >&2; exit 1; }
+	@: "$${BLUE_PGP_KEY:?is not set; see bluectl release upload -h}"
+	@: "$${BLUE_PGP_KEYRING:?is not set; see bluectl release upload -h}"
 
 clean:
-	rm -rf $(TAR)
-	rm -rf $(NOTARIZE_ZIP)
-	rm -rf pkg/
-	rm -rf llvm.tar.xz llvm-extract zig.tar.xz zls.tar.xz zls-extract
-	rm -f tree-sitter-zig/parser.so
+	rm -rf build
+
+distclean: clean
+	rm -rf $(DL)

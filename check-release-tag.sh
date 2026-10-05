@@ -1,7 +1,7 @@
 #!/bin/bash
 # Validate that HEAD carries a release tag the in-product upgrader will
-# accept, before any expensive build/notarize work runs. Invoked as the
-# first prerequisite of the dist-* make targets.
+# accept, before any expensive build work runs. Invoked as the first
+# prerequisite of the dist-* make targets.
 #
 # Rules (kept in sync with the ide upgrade manager):
 #   - version must match canonical semver ("vMAJOR[.MINOR[.PATCH]][-pre][+build]")

@@ -14,36 +14,37 @@ The release instructions below are for Rune maintainers.
 
 ## Release runbook
 
-1. **Prepare the build host.** Build macOS (`darwin`) artifacts on macOS and
-   Linux artifacts on Linux; only the architecture can be cross-built. Install
-   Go, a C compiler, `wget`, `bluectl`, and tar (GNU `gtar` on macOS). Linux
-   cross-architecture builds need the target GNU compiler
-   (`aarch64-linux-gnu-gcc` or `x86_64-linux-gnu-gcc`). macOS releases need the
-   configured Developer ID signing identity and a notarytool profile
-   (`make notary-credentials` to set it up).
+1. **Prepare the build host.** A Mac builds all four platforms; a Linux host
+   builds only the Linux ones. Install Go, Xcode command line tools (macOS),
+   `wget`, `xz`, GNU tar (`gtar` on macOS), `objdump` and `bluectl`.
+   `extension_zig` is pure Go, and the Linux grammar is cross-compiled by a
+   downloaded `zig cc` against glibc 2.28, so no other toolchain is needed.
+   Nothing is codesigned or notarized: Rune installs packages without the
+   quarantine attribute, so Gatekeeper never assesses them.
 2. **Prepare the release.** Fetch tags and submodules
    (`git fetch --tags && git submodule update --init --recursive`), then check
    out a clean, tagged release commit (`v0.0.10` or later). The `dist-*` targets
    reject untagged, dirty, or non-semver releases. Authenticate `bluectl` via
    gcloud Application Default Credentials and set `BLUE_PGP_KEY` and
    `BLUE_PGP_KEYRING` (see `bluectl release upload -h`).
-3. **Publish** with the target matching the environment, OS, and architecture:
+3. **Publish** every platform to an environment:
 
    ```sh
-   make dist-staging-darwin-arm64   # on macOS
-   make dist-prod-darwin-amd64      # on macOS
-   make dist-staging-linux-arm64    # on Linux
-   make dist-prod-linux-amd64       # on Linux
+   make dist-staging-all
+   make dist-prod-all
    ```
 
-   All `staging`/`prod` × `darwin`/`linux` × `arm64`/`amd64` combinations
-   follow this naming pattern. Each target checks the tag, cleans, builds,
-   signs/notarizes on macOS, runs `make test` (including `.go` source-leak
-   checks on the tarball and notarization zip), then uploads `zig.tar.gz` via
-   `dist.sh`. It selects the pinned project and per-platform release bucket
-   from `deploy/bluectl/`; do not run `dist.sh` directly. Run a separate target
-   for each architecture. The `darwin-amd64` package omits `lldb-dap` because
-   LLVM 22 has no official macOS x86_64 prebuilt.
+   `dist-<env>-all` builds and tests all four platforms into
+   `build/<os>-<arch>/zig.tar.gz` and uploads only if every one passes.
+   `dist-<env>-<os>-<arch>` (e.g. `dist-prod-linux-amd64`) releases a single
+   platform, and `release-all` / `release-<os>-<arch>` build and test without
+   uploading. `make test` checks for `.go` source leaks, the glibc 2.28 and
+   macOS 13.3 floors, and arm64 signatures; it runs the packaged binaries only
+   for the host platform. Downloads are cached in `downloads/` (`make
+   distclean` removes them). Each upload selects the pinned project and
+   per-platform release bucket from `deploy/bluectl/`; do not run `dist.sh`
+   directly. The `darwin-amd64` package omits `lldb-dap` because LLVM 22 has
+   no official macOS x86_64 prebuilt.
 
 ## Payload layout
 

@@ -3,7 +3,5 @@
 *.zip
 *.swp
 *.rswp
-pkg/
-llvm-extract/
-zls-extract/
-tree-sitter-zig/parser.so
+build/
+downloads/
