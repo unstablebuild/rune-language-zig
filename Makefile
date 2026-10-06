@@ -1,9 +1,9 @@
 # Release packaging for the Rune zig package. See README.md for the runbook.
 #
 # One host builds every platform: extension_zig is pure Go (CGO_ENABLED=0),
-# the grammar is compiled by `zig cc` for Linux and Apple cc for macOS, and
-# everything else is a prebuilt download. macOS packages need Apple cc (and
-# otool for the tests), so they must be built on macOS.
+# the grammar and lldb-dap are compiled by `zig cc` for Linux and Apple clang
+# for macOS, and zig and zls are prebuilt downloads. macOS packages need Apple
+# clang (and otool for the tests), so they must be built on macOS.
 #
 # Nothing is codesigned or notarized: Rune downloads packages without the
 # quarantine attribute, so Gatekeeper never assesses them. arm64 binaries only
@@ -12,9 +12,8 @@
 ZIG_VERSION=0.16.0
 # zls refuses to serve a zig whose major.minor differs, so these move together.
 ZLS_VERSION=0.16.0
-# lldb-dap is extracted from the official prebuilt LLVM release. Keep this in
-# sync with rune-language-rust: both packages copy a `lldb-dap` into the shared
-# $RUNE_DATADIR/bin, and identical versions make that collision a no-op.
+# lldb-dap is built from this LLVM source release by scripts/build-lldb-dap.sh.
+# Keep it in sync with rune-language-rust, which also ships an lldb-dap.
 LLVM_VERSION=22.1.8
 
 # Platform floors from docs.rune.build; scripts/test.sh enforces them.
@@ -41,7 +40,8 @@ BUILD=build/$(PLATFORM)
 PKG=$(BUILD)/pkg
 TAR=$(BUILD)/zig.tar.gz
 TOOLCHAIN_STAMP=$(BUILD)/.toolchain-stamp
-# Download cache. It survives `make clean`; file names carry the version.
+# Download and lldb-dap build cache. It survives `make clean`; file names carry
+# the version.
 DL=downloads
 
 # GNU tar is named "gtar" on macOS (Homebrew) but is the default "tar" on Linux.
@@ -60,14 +60,8 @@ ZIG_TRIPLE=$(ZIG_ARCH_$(TARGET_ARCH))-$(ZIG_OS_$(TARGET_OS))
 ZIG_TARBALL=$(DL)/zig-$(ZIG_TRIPLE)-$(ZIG_VERSION).tar.xz
 ZLS_TARBALL=$(DL)/zls-$(ZIG_TRIPLE)-$(ZLS_VERSION).tar.xz
 
-# LLVM release assets: LLVM-<version>-<Linux|macOS>-<X64|ARM64>.tar.xz. macOS
-# x86_64 prebuilts stopped at LLVM 19, so darwin-amd64 ships without lldb-dap.
-LLVM_OS_darwin=macOS
-LLVM_OS_linux=Linux
-LLVM_ARCH_amd64=X64
-LLVM_ARCH_arm64=ARM64
-LLVM_ASSET=LLVM-$(LLVM_VERSION)-$(LLVM_OS_$(TARGET_OS))-$(LLVM_ARCH_$(TARGET_ARCH)).tar.xz
-LLDB_DAP=$(filter-out darwin-amd64,$(PLATFORM))
+LLVM_SRC=$(DL)/llvm-project-$(LLVM_VERSION).src.tar.xz
+LLDB_DAP_TARBALL=$(DL)/lldb-dap-$(LLVM_VERSION)-$(PLATFORM).tar.xz
 
 # The host's own zig compiles the grammar for Linux: `zig cc` cross-compiles
 # against a pinned glibc, so no target toolchain or sysroot is needed.
@@ -94,8 +88,8 @@ DIST_ALL_TARGETS=$(addprefix dist-,$(addsuffix -all,$(ENVS)))
 
 default: $(TAR)
 
-# Stage the prebuilt zig toolchain, zls and lldb-dap into the package.
-$(TOOLCHAIN_STAMP): Makefile zig-shim.sh
+# Stage the prebuilt zig toolchain, zls and the built lldb-dap into the package.
+$(TOOLCHAIN_STAMP): Makefile zig-shim.sh $(LLDB_DAP_TARBALL)
 	$(call fetch,https://ziglang.org/download/$(ZIG_VERSION)/zig-$(ZIG_TRIPLE)-$(ZIG_VERSION).tar.xz,$(ZIG_TARBALL))
 	$(call fetch,https://github.com/zigtools/zls/releases/download/$(ZLS_VERSION)/zls-$(ZIG_TRIPLE).tar.xz,$(ZLS_TARBALL))
 	rm -rf $(PKG) && mkdir -p $(PKG)/bin $(PKG)/lib $(PKG)/zig
@@ -115,21 +109,29 @@ $(TOOLCHAIN_STAMP): Makefile zig-shim.sh
 	install -m 0755 zig-shim.sh $(PKG)/bin/zig
 	# zls: single static binary, no sibling data.
 	$(GTAR) -xJf $(ZLS_TARBALL) -C $(PKG)/bin zls
-ifneq ($(LLDB_DAP),)
-	# lldb-dap: extract only bin/lldb-dap + the liblldb shared lib it links
-	# from the ~1.5GB prebuilt LLVM tarball. Its rpath is @loader_path/../lib
-	# ($$ORIGIN/../lib on Linux), which resolves inside the installed package
-	# dir (bin/ + lib/ siblings) -- config.yaml therefore invokes it by its
-	# package-local path, not through $$RUNE_DATADIR/bin.
-	$(call fetch,https://github.com/llvm/llvm-project/releases/download/llvmorg-$(LLVM_VERSION)/$(LLVM_ASSET),$(DL)/$(LLVM_ASSET))
-	$(GTAR) -xJf $(DL)/$(LLVM_ASSET) -C $(PKG) --strip-components=1 --wildcards \
-		'*/bin/lldb-dap' '*/lib/liblldb.*'
-endif
+	# lldb-dap + liblldb (+ lldb-server on Linux). lldb-dap's rpath is
+	# @loader_path/../lib ($$ORIGIN/../lib on Linux), which resolves inside
+	# the installed package dir (bin/ + lib/ siblings) -- config.yaml
+	# therefore invokes it by its package-local path, not through
+	# $$RUNE_DATADIR/bin.
+	$(GTAR) -xJf $(LLDB_DAP_TARBALL) -C $(PKG) --strip-components=1
 	touch $@
 
 $(HOST_ZIG):
 	$(call fetch,https://ziglang.org/download/$(ZIG_VERSION)/$(notdir $(HOST_ZIG_DIR)).tar.xz,$(HOST_ZIG_DIR).tar.xz)
 	$(GTAR) -xJf $(HOST_ZIG_DIR).tar.xz -C $(DL)
+
+$(LLVM_SRC):
+	$(call fetch,https://github.com/llvm/llvm-project/releases/download/llvmorg-$(LLVM_VERSION)/$(notdir $(LLVM_SRC)),$@)
+
+# Upstream lldb-dap prebuilts need macOS 14.0, and glibc 2.34 plus system
+# libpython3.11, libxml2 and ncurses, so it is built from source (see the
+# script). The first build takes about 10 minutes per platform on a 16-core
+# Mac and needs cmake and ninja; the result is cached in $(DL).
+$(LLDB_DAP_TARBALL): $(LLVM_SRC) $(HOST_ZIG) scripts/build-lldb-dap.sh
+	LLVM_SRC=$(LLVM_SRC) LLVM_VERSION=$(LLVM_VERSION) MACOS_MIN=$(MACOS_MIN) \
+		GLIBC_MIN=$(GLIBC_MIN) ZIG=$(HOST_ZIG) WORK=build/lldb \
+		./scripts/build-lldb-dap.sh $(TARGET_OS) $(TARGET_ARCH) $@
 
 # Build the grammar and extension_zig into the staged package. They are
 # rebuilt on every run: both are quick, and a stale binary must never ship.

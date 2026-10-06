@@ -1,7 +1,7 @@
 # rune-language-zig
 
 Rune language package for Zig: the `zig` toolchain, `zls`, `extension_zig`,
-the tree-sitter grammar and `lldb-dap`, shipped as one signed tarball
+the tree-sitter grammar and `lldb-dap`, shipped as one tarball
 published to the `zig` package id.
 
 To install Zig support in Rune, run this command in the Rune console:
@@ -16,9 +16,10 @@ The release instructions below are for Rune maintainers.
 
 1. **Prepare the build host.** A Mac builds all four platforms; a Linux host
    builds only the Linux ones. Install Go, Xcode command line tools (macOS),
-   `wget`, `xz`, GNU tar (`gtar` on macOS), `objdump` and `bluectl`.
-   `extension_zig` is pure Go, and the Linux grammar is cross-compiled by a
-   downloaded `zig cc` against glibc 2.28, so no other toolchain is needed.
+   `wget`, `xz`, GNU tar (`gtar` on macOS), `objdump`, `cmake`, `ninja` and
+   `bluectl`. `extension_zig` is pure Go, and the Linux grammar and `lldb-dap`
+   are cross-compiled by a downloaded `zig cc` against glibc 2.28, so no other
+   toolchain is needed.
    Nothing is codesigned or notarized: Rune installs packages without the
    quarantine attribute, so Gatekeeper never assesses them.
 2. **Prepare the release.** Fetch tags and submodules
@@ -39,12 +40,14 @@ The release instructions below are for Rune maintainers.
    `dist-<env>-<os>-<arch>` (e.g. `dist-prod-linux-amd64`) releases a single
    platform, and `release-all` / `release-<os>-<arch>` build and test without
    uploading. `make test` checks for `.go` source leaks, the glibc 2.28 and
-   macOS 13.3 floors, and arm64 signatures; it runs the packaged binaries only
-   for the host platform. Downloads are cached in `downloads/` (`make
-   distclean` removes them). Each upload selects the pinned project and
-   per-platform release bucket from `deploy/bluectl/`; do not run `dist.sh`
-   directly. The `darwin-amd64` package omits `lldb-dap` because LLVM 22 has
-   no official macOS x86_64 prebuilt.
+   macOS 13.3 floors, OS-only library dependencies, and arm64 signatures; for
+   the host platform it also runs the packaged binaries, including a real
+   `lldb-dap` debug session. Downloads are cached in `downloads/` (`make
+   distclean` removes them), as is `lldb-dap`, which is built from the LLVM
+   source release by `scripts/build-lldb-dap.sh`: the first build takes about
+   10 minutes per platform on a 16-core Mac. Each upload selects the pinned
+   project and per-platform release bucket from `deploy/bluectl/`; do not run
+   `dist.sh` directly.
 
 ## Payload layout
 
@@ -53,8 +56,9 @@ pkg/
   config.yaml
   zig/{.zig, lib/**}         # compiler (hidden) + its 225MB lib (std, libc, compiler-rt)
   bin/{zig, zls, extension_zig, lldb-dap}   # zig is the zig-shim.sh wrapper
+  bin/lldb-server            # Linux only; macOS uses Apple's debugserver
   lib/{tree-sitter.so, highlights.scm, indents.scm, folds.scm, locals.scm}
-  lib/liblldb.*              # absent on darwin-amd64
+  lib/liblldb.*
 ```
 
 Three non-obvious invariants, all consequences of how the installer publishes a
@@ -82,8 +86,11 @@ package: it symlinks the version dir at `$RUNE_DATADIR/lib/<pkg-id>` and
    rune-language-rust ships the same binary name, so the shared copy is
    whichever package installed last and is deleted when either is uninstalled.
    Its rpath (`@loader_path/../lib`) also only resolves inside the package dir,
-   where `bin/` and `lib/` are siblings. Keep `LLVM_VERSION` in sync with
-   rune-language-rust so the colliding copy stays byte-identical.
+   where `bin/` and `lib/` are siblings. On Linux, lldb launches the
+   `lldb-server` next to it (`<liblldb dir>/../bin`); on macOS it falls back to
+   the signed `debugserver` from the Xcode command line tools, which macOS
+   debugging therefore requires.
 
 `scripts/test.sh` pins invariants 1-3 against the built tarball, including a
-real `zig build` through the shim from a simulated `$RUNE_DATADIR`.
+real `zig build` through the shim from a simulated `$RUNE_DATADIR` and a debug
+session through the package-local `lldb-dap`.

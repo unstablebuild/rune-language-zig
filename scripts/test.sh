@@ -18,16 +18,19 @@
 #      inside Rune, and the env var would pin user-provided toolchains (e.g. a
 #      dev compiler) to this package's std lib.
 #   6. Binaries meet the platform floors on docs.rune.build: Mach-O minos <=
-#      $MACOS_MIN, ELF glibc symbol versions <= $GLIBC_MIN. lldb-dap and
-#      liblldb are not checked: the upstream LLVM prebuilts need macOS 14.0,
-#      and glibc 2.34 plus a system libpython3.11.
+#      $MACOS_MIN, ELF glibc symbol versions <= $GLIBC_MIN. They also link
+#      nothing beyond the OS: glibc's own libraries on Linux, /usr/lib and
+#      /System on macOS, plus the packaged liblldb. Upstream lldb-dap
+#      prebuilts failed both (macOS 14.0; glibc 2.34, libstdc++, libpython).
 #   7. darwin-arm64 Mach-O files carry a valid ad-hoc signature. This is not
 #      Developer ID signing or notarization: the arm64 kernel kills any code
 #      without a valid signature on exec, quarantined or not. The build signs
 #      nothing and relies on the ad-hoc signature each linker embeds, which
 #      any post-link edit (strip, install_name_tool, ...) would invalidate.
+#   8. lldb-dap debugs a zig program from the package layout, as config.yaml
+#      runs it: it stops at a breakpoint and reads a local (scripts/dapsmoke).
 #
-# Guards 3 and 4 and the lldb-dap check execute the packaged binaries, so they
+# Guards 3, 4 and 8 execute the packaged binaries, so they
 # only run when RUN_BINARIES=1 (the tarball targets the host platform).
 set -euo pipefail
 
@@ -45,7 +48,9 @@ if [ ! -f "$TAR" ]; then
 	exit 1
 fi
 
-workdir="$(mktemp -d)"
+# Resolved (macOS mktemp lives under the /var -> /private/var symlink): the
+# lldb-dap check matches breakpoint paths verbatim against debug info.
+workdir="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$workdir"' EXIT
 
 # List archive members. Matches the build's gtar invocation (entries are
@@ -64,13 +69,13 @@ fi
 echo "ok: no .go files in $TAR"
 
 for want in ./zig/.zig ./zig/lib/std/std.zig ./bin/zig ./bin/zls ./bin/extension_zig \
-	./lib/tree-sitter.so ./lib/highlights.scm ./config.yaml; do
+	./lib/tree-sitter.so ./lib/highlights.scm ./bin/lldb-dap ./config.yaml; do
 	if ! grep -qxF "$want" "$members"; then
 		echo "error: $TAR is missing $want" >&2
 		exit 1
 	fi
 done
-echo "ok: zig toolchain, zls, extension and grammar payload present in $TAR"
+echo "ok: zig toolchain, zls, extension, grammar and lldb-dap payload present in $TAR"
 
 # The real compiler must ship hidden-only: a non-hidden executable named zig
 # outside bin/ would be flat-copied over the shim in $RUNE_DATADIR/bin.
@@ -92,7 +97,20 @@ sort_versions() { sort -t. -k1,1n -k2,2n -k3,3n; }
 # version_le A B: true if dotted version A <= B.
 version_le() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort_versions | head -1)" = "$1" ]; }
 
-for f in zig/.zig bin/zls bin/extension_zig lib/tree-sitter.so; do
+# Every shipped executable and shared library (liblldb's symlinks excluded).
+binaries="zig/.zig bin/zls bin/extension_zig lib/tree-sitter.so bin/lldb-dap"
+for f in "$workdir"/lib/liblldb.*; do
+	[ -L "$f" ] || binaries="$binaries lib/${f##*/}"
+done
+if [ "$TARGET_OS" = linux ]; then
+	binaries="$binaries bin/lldb-server"
+fi
+
+for f in $binaries; do
+	if [ ! -f "$workdir/$f" ]; then
+		echo "error: $TAR is missing $f" >&2
+		exit 1
+	fi
 	case "$TARGET_OS" in
 	darwin)
 		minos="$(otool -l "$workdir/$f" | awk '$1 == "minos" {print $2}' | sort_versions | tail -1)"
@@ -100,6 +118,8 @@ for f in zig/.zig bin/zls bin/extension_zig lib/tree-sitter.so; do
 			echo "error: $f requires macOS ${minos:-<unknown>}, above the $MACOS_MIN floor" >&2
 			exit 1
 		fi
+		foreign="$(otool -L "$workdir/$f" | tail -n +2 | awk '{print $1}' |
+			{ grep -vE '^(/usr/lib/|/System/Library/|@rpath/liblldb\.)' || true; })"
 		;;
 	linux)
 		command -v objdump > /dev/null || { echo "error: objdump is required to check glibc floors" >&2; exit 1; }
@@ -110,14 +130,19 @@ for f in zig/.zig bin/zls bin/extension_zig lib/tree-sitter.so; do
 			echo "error: $f requires glibc $glibc, above the $GLIBC_MIN floor" >&2
 			exit 1
 		fi
+		foreign="$({ objdump -p "$workdir/$f" 2>/dev/null || true; } | awk '$1 == "NEEDED" {print $2}' |
+			{ grep -vE '^(libc|libm|libdl|libpthread|librt|libutil)\.so\.[0-9]+$|^ld-linux-(x86-64|aarch64)\.so\.[0-9]+$|^liblldb\.so\.' || true; })"
 		;;
 	esac
+	if [ -n "$foreign" ]; then
+		echo "error: $f links libraries outside the OS:" $foreign >&2
+		exit 1
+	fi
 done
-echo "ok: binaries meet the $TARGET_OS floor (macOS $MACOS_MIN / glibc $GLIBC_MIN)"
+echo "ok: binaries meet the $TARGET_OS floor (macOS $MACOS_MIN / glibc $GLIBC_MIN) and link only OS libraries"
 
 if [ "$TARGET_OS-$TARGET_ARCH" = darwin-arm64 ]; then
-	for f in zig/.zig bin/zls bin/extension_zig lib/tree-sitter.so bin/lldb-dap lib/liblldb.*.dylib; do
-		[ -e "$workdir/$f" ] || continue
+	for f in $binaries; do
 		if ! codesign --verify "$workdir/$f" 2>/dev/null; then
 			echo "error: $f has no valid ad-hoc signature; the arm64 kernel kills it on exec" >&2
 			exit 1
@@ -189,14 +214,26 @@ if [ "$zig_mm" != "$zls_mm" ]; then
 fi
 echo "ok: zig $zig_version and zls $zls_version are a matched pair"
 
-# lldb-dap ships everywhere except darwin-amd64 (no official LLVM prebuilt).
-# When present, it must load liblldb from its package-local sibling lib/,
-# which is the path config.yaml's debugger command uses.
-if [ -f "$workdir/bin/lldb-dap" ]; then
-	if ! "$workdir/bin/lldb-dap" --help > /dev/null 2>&1; then
-		echo "error: packaged lldb-dap cannot run from its package layout" >&2
-		"$workdir/bin/lldb-dap" --help >&2 || true
-		exit 1
-	fi
-	echo "ok: lldb-dap runs from the package bin/ + lib/ layout"
+# lldb-dap must load liblldb from its package-local sibling lib/, which is
+# the path config.yaml's debugger command uses, and debug a zig program:
+# macOS through Apple's debugserver, Linux through the packaged lldb-server.
+if ! "$workdir/bin/lldb-dap" --help > /dev/null 2>&1; then
+	echo "error: packaged lldb-dap cannot run from its package layout" >&2
+	"$workdir/bin/lldb-dap" --help >&2 || true
+	exit 1
 fi
+mkdir -p "$workdir/debug"
+printf '%s\n' 'const std = @import("std");' '' 'pub fn main() void {' \
+	'    var x: u32 = 41;' '    x += 1;' '    std.mem.doNotOptimizeAway(x);' '}' > "$workdir/debug/main.zig"
+(
+	cd "$workdir/debug"
+	ZIG_GLOBAL_CACHE_DIR="$workdir/zig-cache" "$workdir/bin/zig" build-exe -femit-bin=debuggee main.zig
+)
+(cd "$(dirname "$0")/dapsmoke" && go build -o "$workdir/dapsmoke" .)
+if ! "$workdir/dapsmoke" -adapter "$workdir/bin/lldb-dap" -program "$workdir/debug/debuggee" \
+	-source "$workdir/debug/main.zig" -line 5 -var x=41 > "$workdir/dapsmoke.log" 2>&1; then
+	echo "error: packaged lldb-dap failed to debug a zig program:" >&2
+	cat "$workdir/dapsmoke.log" >&2
+	exit 1
+fi
+echo "ok: lldb-dap debugs a zig program from the package layout ($(tail -1 "$workdir/dapsmoke.log"))"
