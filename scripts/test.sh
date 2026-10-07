@@ -22,11 +22,12 @@
 #      nothing beyond the OS: glibc's own libraries on Linux, /usr/lib and
 #      /System on macOS, plus the packaged liblldb. Upstream lldb-dap
 #      prebuilts failed both (macOS 14.0; glibc 2.34, libstdc++, libpython).
-#   7. darwin-arm64 Mach-O files carry a valid ad-hoc signature. This is not
-#      Developer ID signing or notarization: the arm64 kernel kills any code
-#      without a valid signature on exec, quarantined or not. The build signs
-#      nothing and relies on the ad-hoc signature each linker embeds, which
-#      any post-link edit (strip, install_name_tool, ...) would invalidate.
+#   7. macOS targets: Rune.app can load the package. Every Mach-O file, found
+#      by scanning, is signed with the $TEAM_ID Developer ID; and
+#      tree-sitter.so loads into a process signed like Rune.app, whose library
+#      validation refuses a tree-sitter.so signed by any other team (or
+#      ad-hoc). This runs for both macOS architectures on any Apple silicon
+#      host, x86_64 under Rosetta (scripts/macos-signing.sh check).
 #   8. lldb-dap debugs a zig program from the package layout, as config.yaml
 #      runs it: it stops at a breakpoint and reads a local (scripts/dapsmoke).
 #
@@ -42,6 +43,10 @@ GLIBC_MIN="${GLIBC_MIN:?}"
 RUN_BINARIES="${RUN_BINARIES:-0}"
 ZIG_VERSION="${ZIG_VERSION:-}"
 ZLS_VERSION="${ZLS_VERSION:-}"
+if [ "$TARGET_OS" = darwin ]; then
+	TEAM_ID="${TEAM_ID:?}"
+	CODESIGN_IDENTITY="${CODESIGN_IDENTITY:?}"
+fi
 
 if [ ! -f "$TAR" ]; then
 	echo "error: $TAR not found; run 'make' first" >&2
@@ -141,14 +146,9 @@ for f in $binaries; do
 done
 echo "ok: binaries meet the $TARGET_OS floor (macOS $MACOS_MIN / glibc $GLIBC_MIN) and link only OS libraries"
 
-if [ "$TARGET_OS-$TARGET_ARCH" = darwin-arm64 ]; then
-	for f in $binaries; do
-		if ! codesign --verify "$workdir/$f" 2>/dev/null; then
-			echo "error: $f has no valid ad-hoc signature; the arm64 kernel kills it on exec" >&2
-			exit 1
-		fi
-	done
-	echo "ok: every darwin-arm64 binary carries a valid ad-hoc signature"
+if [ "$TARGET_OS" = darwin ]; then
+	TEAM_ID="$TEAM_ID" CODESIGN_IDENTITY="$CODESIGN_IDENTITY" TARGET_ARCH="$TARGET_ARCH" \
+		"$(dirname "$0")/macos-signing.sh" check "$workdir" tree_sitter_zig
 fi
 
 if [ "$RUN_BINARIES" != 1 ]; then

@@ -3,11 +3,13 @@
 # One host builds every platform: extension_zig is pure Go (CGO_ENABLED=0),
 # the grammar and lldb-dap are compiled by `zig cc` for Linux and Apple clang
 # for macOS, and zig and zls are prebuilt downloads. macOS packages need Apple
-# clang (and otool for the tests), so they must be built on macOS.
+# clang and codesign, so they must be built on macOS.
 #
-# Nothing is codesigned or notarized: Rune downloads packages without the
-# quarantine attribute, so Gatekeeper never assesses them. arm64 binaries only
-# need the ad-hoc signature their linkers already embed (checked by the tests).
+# macOS binaries are signed with Rune's Developer ID. Rune.app runs with the
+# hardened runtime, whose library validation refuses to load a tree-sitter.so
+# signed by any other team; an ad-hoc signature has no team. Packages are not
+# notarized: Rune installs them without the quarantine attribute, so
+# Gatekeeper never assesses them.
 
 ZIG_VERSION=0.16.0
 # zls refuses to serve a zig whose major.minor differs, so these move together.
@@ -22,6 +24,12 @@ GLIBC_MIN=2.28
 
 PLATFORMS=darwin-arm64 darwin-amd64 linux-arm64 linux-amd64
 ENVS=prod staging
+
+TEAM_ID=YYZRWD888J
+CODESIGN_IDENTITY=Developer ID Application: Unstable Build, LLC. ($(TEAM_ID))
+# Signs and checks macOS packages; shared by every language repo.
+MACOS_SIGNING=TEAM_ID=$(TEAM_ID) CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" \
+	TARGET_ARCH=$(TARGET_ARCH) ./scripts/macos-signing.sh
 
 HOST_OS:=$(shell uname | tr '[:upper:]' '[:lower:]')
 HOST_ARCH:=$(shell uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/')
@@ -80,11 +88,13 @@ endif
 fetch=mkdir -p $(DL) && { [ -f $2 ] || { wget -O $2.part $1 && mv $2.part $2; }; }
 
 RELEASE_TARGETS=$(addprefix release-,$(PLATFORMS))
+DARWIN_RELEASE_TARGETS=$(filter release-darwin-%,$(RELEASE_TARGETS))
 DIST_TARGETS=$(foreach e,$(ENVS),$(foreach p,$(PLATFORMS),dist-$e-$p))
 DIST_ALL_TARGETS=$(addprefix dist-,$(addsuffix -all,$(ENVS)))
 
-.PHONY: default package test clean distclean \
-	check-dist release-all $(RELEASE_TARGETS) $(DIST_TARGETS) $(DIST_ALL_TARGETS)
+.PHONY: default package sign test clean distclean \
+	check-dist check-macos release-all $(RELEASE_TARGETS) $(DIST_TARGETS) \
+	$(DIST_ALL_TARGETS)
 
 default: $(TAR)
 
@@ -145,7 +155,15 @@ package: $(TOOLCHAIN_STAMP) $(if $(filter linux,$(TARGET_OS)),$(HOST_ZIG))
 		go build -o $(CURDIR)/$(PKG)/bin/extension_zig ./cmd/extension_zig
 	cp config.yaml $(PKG)
 
-$(TAR): package
+# Developer ID-sign every Mach-O file in a macOS package in place, replacing
+# their ad-hoc signatures. The files are found by scanning, so a binary added
+# later is signed too. Linux packages are not signed.
+sign: package
+ifeq ($(TARGET_OS),darwin)
+	$(MACOS_SIGNING) sign $(PKG)
+endif
+
+$(TAR): sign
 	cd $(PKG) && $(GTAR) --no-xattrs --no-acls -czf $(CURDIR)/$@ .
 
 # Verify the tarball (see scripts/test.sh). Binaries only run when the target
@@ -154,6 +172,7 @@ test: $(TAR)
 	TAR=$(TAR) TARGET_OS=$(TARGET_OS) TARGET_ARCH=$(TARGET_ARCH) \
 		ZIG_VERSION=$(ZIG_VERSION) ZLS_VERSION=$(ZLS_VERSION) \
 		MACOS_MIN=$(MACOS_MIN) GLIBC_MIN=$(GLIBC_MIN) \
+		TEAM_ID=$(TEAM_ID) CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" \
 		RUN_BINARIES=$(if $(filter $(HOST_OS)-$(HOST_ARCH),$(PLATFORM)),1,0) \
 		./scripts/test.sh
 
@@ -163,7 +182,10 @@ $(RELEASE_TARGETS): release-%:
 	rm -rf build/$*
 	$(MAKE) test TARGET_OS=$(word 1,$(subst -, ,$*)) TARGET_ARCH=$(word 2,$(subst -, ,$*))
 
-release-all:
+$(DARWIN_RELEASE_TARGETS): check-macos
+
+# Linux hosts cannot build the macOS packages, so they cannot release all.
+release-all: check-macos
 	for p in $(PLATFORMS); do $(MAKE) release-$$p || exit 1; done
 
 # dist-<env>-<os>-<arch>: release one platform and upload it to <env>.
@@ -172,8 +194,9 @@ $(DIST_TARGETS): dist-%: check-dist
 	./dist.sh $(subst -, ,$*)
 
 # dist-<env>-all: release all four platforms, then upload them. Nothing is
-# uploaded unless every platform builds and passes its tests.
-$(DIST_ALL_TARGETS): dist-%-all: check-dist
+# uploaded unless every platform builds and passes its tests. It fails on
+# Linux, which cannot build the macOS packages.
+$(DIST_ALL_TARGETS): dist-%-all: check-macos check-dist
 	$(MAKE) release-all
 	for p in $(PLATFORMS); do ./dist.sh $* $${p%-*} $${p#*-} || exit 1; done
 
@@ -183,6 +206,11 @@ check-dist:
 	@command -v bluectl >/dev/null || { echo "error: bluectl is not on PATH" >&2; exit 1; }
 	@: "$${BLUE_PGP_KEY:?is not set; see bluectl release upload -h}"
 	@: "$${BLUE_PGP_KEYRING:?is not set; see bluectl release upload -h}"
+
+# Fail before any build work if this host cannot sign the macOS packages:
+# macOS and the Developer ID identity.
+check-macos:
+	@$(MACOS_SIGNING) preflight
 
 clean:
 	rm -rf build

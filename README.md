@@ -15,13 +15,18 @@ The release instructions below are for Rune maintainers.
 ## Release runbook
 
 1. **Prepare the build host.** A Mac builds all four platforms; a Linux host
-   builds only the Linux ones. Install Go, Xcode command line tools (macOS),
+   builds only the Linux ones, so `release-all` and `dist-<env>-all` fail on
+   Linux. Install Go, Xcode command line tools (macOS),
    `wget`, `xz`, GNU tar (`gtar` on macOS), `objdump`, `cmake`, `ninja` and
    `bluectl`. `extension_zig` is pure Go, and the Linux grammar and `lldb-dap`
    are cross-compiled by a downloaded `zig cc` against glibc 2.28, so no other
    toolchain is needed.
-   Nothing is codesigned or notarized: Rune installs packages without the
-   quarantine attribute, so Gatekeeper never assesses them.
+   macOS binaries are signed with the `Developer ID Application: Unstable
+   Build, LLC. (YYZRWD888J)` identity, so the Mac needs that identity in its
+   keychain. Rune.app runs with the hardened runtime, which refuses to load a
+   `tree-sitter.so` signed by any other team. Packages are not notarized: Rune
+   installs them without the quarantine attribute, so Gatekeeper never
+   assesses them.
 2. **Prepare the release.** Fetch tags and submodules
    (`git fetch --tags && git submodule update --init --recursive`), then check
    out a clean, tagged release commit (`v0.0.10` or later). The `dist-*` targets
@@ -39,10 +44,14 @@ The release instructions below are for Rune maintainers.
    `build/<os>-<arch>/zig.tar.gz` and uploads only if every one passes.
    `dist-<env>-<os>-<arch>` (e.g. `dist-prod-linux-amd64`) releases a single
    platform, and `release-all` / `release-<os>-<arch>` build and test without
-   uploading. `make test` checks for `.go` source leaks, the glibc 2.28 and
-   macOS 13.3 floors, OS-only library dependencies, and arm64 signatures; for
-   the host platform it also runs the packaged binaries, including a real
-   `lldb-dap` debug session. Downloads are cached in `downloads/` (`make
+   uploading. `make test` checks for `.go` source
+   leaks, the glibc 2.28 and macOS 13.3 floors, OS-only library dependencies,
+   and, for macOS, that Rune.app can load the package: every Mach-O file is
+   Developer ID-signed, and `tree-sitter.so` loads into a process signed like
+   Rune.app, x86_64 under Rosetta (`scripts/macos-signing.sh`, shared by every
+   language repo). For the host platform it also runs the packaged binaries,
+   including a real `lldb-dap` debug session.
+   Downloads are cached in `downloads/` (`make
    distclean` removes them), as is `lldb-dap`, which is built from the LLVM
    source release by `scripts/build-lldb-dap.sh`: the first build takes about
    10 minutes per platform on a 16-core Mac. Each upload selects the pinned
