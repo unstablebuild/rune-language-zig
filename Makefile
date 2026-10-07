@@ -5,11 +5,11 @@
 # for macOS, and zig and zls are prebuilt downloads. macOS packages need Apple
 # clang and codesign, so they must be built on macOS.
 #
-# macOS binaries are signed with Rune's Developer ID. Rune.app runs with the
-# hardened runtime, whose library validation refuses to load a tree-sitter.so
-# signed by any other team; an ad-hoc signature has no team. Packages are not
-# notarized: Rune installs them without the quarantine attribute, so
-# Gatekeeper never assesses them.
+# The macOS tree-sitter.so is signed with Rune's Developer ID. Rune.app runs
+# with the hardened runtime, whose library validation refuses to load a
+# tree-sitter.so signed by any other team; an ad-hoc signature has no team.
+# Packages are not notarized: Rune installs them without the quarantine
+# attribute, so Gatekeeper never assesses them.
 
 ZIG_VERSION=0.16.0
 # zls refuses to serve a zig whose major.minor differs, so these move together.
@@ -155,9 +155,11 @@ package: $(TOOLCHAIN_STAMP) $(if $(filter linux,$(TARGET_OS)),$(HOST_ZIG))
 		go build -o $(CURDIR)/$(PKG)/bin/extension_zig ./cmd/extension_zig
 	cp config.yaml $(PKG)
 
-# Developer ID-sign every Mach-O file in a macOS package in place, replacing
-# their ad-hoc signatures. The files are found by scanning, so a binary added
-# later is signed too. Linux packages are not signed.
+# Developer ID-sign tree-sitter.so in a macOS package, the one file Rune loads
+# into its own process. The other binaries keep the signatures their linker or
+# vendor gave them: re-signing the upstream x86_64 zig and zls overwrote the
+# start of their code, so zls crashed on Intel Macs in v0.2.0 and v0.4.1.
+# Linux packages are not signed.
 sign: package
 ifeq ($(TARGET_OS),darwin)
 	$(MACOS_SIGNING) sign $(PKG)

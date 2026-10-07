@@ -21,12 +21,13 @@ The release instructions below are for Rune maintainers.
    `bluectl`. `extension_zig` is pure Go, and the Linux grammar and `lldb-dap`
    are cross-compiled by a downloaded `zig cc` against glibc 2.28, so no other
    toolchain is needed.
-   macOS binaries are signed with the `Developer ID Application: Unstable
-   Build, LLC. (YYZRWD888J)` identity, so the Mac needs that identity in its
-   keychain. Rune.app runs with the hardened runtime, which refuses to load a
-   `tree-sitter.so` signed by any other team. Packages are not notarized: Rune
-   installs them without the quarantine attribute, so Gatekeeper never
-   assesses them.
+   The macOS `tree-sitter.so` is signed with the `Developer ID Application:
+   Unstable Build, LLC. (YYZRWD888J)` identity, so the Mac needs that identity
+   in its keychain. Rune.app runs with the hardened runtime, which refuses to
+   load a `tree-sitter.so` signed by any other team. The other binaries run as
+   separate processes and keep their linker or vendor signatures. Packages are
+   not notarized: Rune installs them without the quarantine attribute, so
+   Gatekeeper never assesses them.
 2. **Prepare the release.** Fetch tags and submodules
    (`git fetch --tags && git submodule update --init --recursive`), then check
    out a clean, tagged release commit (`v0.0.10` or later). The `dist-*` targets
@@ -46,11 +47,12 @@ The release instructions below are for Rune maintainers.
    platform, and `release-all` / `release-<os>-<arch>` build and test without
    uploading. `make test` checks for `.go` source
    leaks, the glibc 2.28 and macOS 13.3 floors, OS-only library dependencies,
-   and, for macOS, that Rune.app can load the package: every Mach-O file is
-   Developer ID-signed, and `tree-sitter.so` loads into a process signed like
-   Rune.app, x86_64 under Rosetta (`scripts/macos-signing.sh`, shared by every
-   language repo). For the host platform it also runs the packaged binaries,
-   including a real `lldb-dap` debug session.
+   and, for macOS, that Rune.app can load the package: `tree-sitter.so` is
+   Developer ID-signed and loads into a process signed like Rune.app, x86_64
+   under Rosetta, and every binary is intact and validly signed
+   (`scripts/macos-signing.sh`, shared by every language repo). For the host
+   platform it also runs the packaged binaries, including a real `lldb-dap`
+   debug session.
    Downloads are cached in `downloads/` (`make
    distclean` removes them), as is `lldb-dap`, which is built from the LLVM
    source release by `scripts/build-lldb-dap.sh`: the first build takes about

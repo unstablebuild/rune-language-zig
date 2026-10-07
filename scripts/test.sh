@@ -22,12 +22,14 @@
 #      nothing beyond the OS: glibc's own libraries on Linux, /usr/lib and
 #      /System on macOS, plus the packaged liblldb. Upstream lldb-dap
 #      prebuilts failed both (macOS 14.0; glibc 2.34, libstdc++, libpython).
-#   7. macOS targets: Rune.app can load the package. Every Mach-O file, found
-#      by scanning, is signed with the $TEAM_ID Developer ID; and
-#      tree-sitter.so loads into a process signed like Rune.app, whose library
-#      validation refuses a tree-sitter.so signed by any other team (or
-#      ad-hoc). This runs for both macOS architectures on any Apple silicon
-#      host, x86_64 under Rosetta (scripts/macos-signing.sh check).
+#   7. macOS targets: Rune.app can load the package. tree-sitter.so is signed
+#      with the $TEAM_ID Developer ID and loads into a process signed like
+#      Rune.app, whose library validation refuses a tree-sitter.so signed by
+#      any other team (or ad-hoc). Every Mach-O file, found by scanning, is
+#      intact and validly signed: re-signing the upstream x86_64 zig and zls
+#      overwrote the start of their code, so zls crashed on launch. This runs
+#      for both macOS architectures on any Apple silicon host, x86_64 under
+#      Rosetta (scripts/macos-signing.sh check).
 #   8. lldb-dap debugs a zig program from the package layout, as config.yaml
 #      runs it: it stops at a breakpoint and reads a local (scripts/dapsmoke).
 #

@@ -10,6 +10,15 @@
 # different Team IDs", and Rune reports that the syntax tree parser is not
 # available.
 #
+# Only lib/tree-sitter.so is signed. It is the one file Rune loads into its
+# own process; the package's other binaries run as separate processes, which
+# library validation does not involve, so they keep the signatures their
+# linker or vendor gave them. Re-signing them gains nothing and can corrupt
+# them: codesign adds its load command in the padding between the Mach-O
+# header and the code, and where the padding is too small, as in the upstream
+# x86_64 zig and zls, it overwrites the start of the code and still produces
+# a valid signature. zig v0.4.1's zls crashed on launch on Intel Macs.
+#
 # Packages are not notarized. Notarization only matters to Gatekeeper, which
 # assesses quarantined files, and Rune installs packages without the
 # quarantine attribute. The Developer ID signature is what Rune needs.
@@ -17,8 +26,8 @@
 # Usage: macos-signing.sh <command> [args]
 #   preflight             fail unless this host can sign: macOS and the
 #                         Developer ID identity
-#   files <dir>           list the Mach-O files under <dir> that need signing
-#   sign <dir>            sign them with the Developer ID
+#   files <dir>           list the Mach-O files under <dir>
+#   sign <dir>            sign <dir>/lib/tree-sitter.so with the Developer ID
 #   check <dir> <symbol>  verify an extracted package (see check below)
 #
 # Environment: TEAM_ID and CODESIGN_IDENTITY; TARGET_ARCH (arm64 or amd64)
@@ -55,8 +64,8 @@ preflight() {
 
 # files: every Mach-O executable, dynamic library and bundle under <dir>,
 # relative to it. Found by scanning rather than from a list, so a binary added
-# to a package later is signed and checked too. Object files (Go's .syso, test
-# fixtures) are never loaded or run, so they are not signed.
+# to a package later is checked too. Object files (Go's .syso, test fixtures)
+# are never loaded or run, so they are not checked.
 files() {
 	local dir=$1 f
 	# Read the magic number first: running file(1) on every file of a large
@@ -74,51 +83,100 @@ files() {
 		done
 }
 
-# sign replaces the linkers' ad-hoc signatures (and vendor signatures, such as
-# on downloaded tools) with the Developer ID. Only the team matters to library
-# validation, so there is no hardened runtime, which notarization would need.
+# sign replaces the linker's ad-hoc signature on tree-sitter.so with the
+# Developer ID. Only the team matters to library validation, so there is no
+# hardened runtime, which notarization would need.
 sign() {
-	local dir=$1 list
-	list="$(files "$dir")"
-	[ -n "$list" ] || die "no Mach-O files to sign in $dir"
-	(cd "$dir" && printf '%s\n' "$list" | tr '\n' '\0' |
-		xargs -0 codesign --force --sign "$CODESIGN_IDENTITY")
+	local so=$1/lib/tree-sitter.so
+	[ -f "$so" ] || die "$so not found"
+	codesign --force --sign "$CODESIGN_IDENTITY" "$so"
+}
+
+# intact: in <slice> of <file>, the load commands end before the first
+# section, so no post-link edit such as codesign has written over the code.
+intact() {
+	local f=$1 slice=$2 end first
+	end="$(otool -arch "$slice" -h "$f" | awk '
+		$1 == "0xfeedfacf" { print 32 + $7 }
+		$1 == "0xfeedface" { print 28 + $7 }')"
+	# Zero-fill sections have no file offset.
+	first="$(otool -arch "$slice" -l "$f" | awk '
+		$1 == "Load" { s = 0 }
+		$1 == "Section" { s = 1 }
+		s && $1 == "offset" && $2 + 0 > 0 && (m == "" || $2 + 0 < m) { m = $2 + 0 }
+		END { print m }')"
+	[ -n "$end" ] && { [ -z "$first" ] || [ "$end" -le "$first" ]; }
+}
+
+# signed: <slice> of <file> has a valid signature, or is x86_64 code without
+# one.
+signed() {
+	local f=$1 slice=$2 info
+	codesign --verify --arch "$slice" "$f" 2> /dev/null && return 0
+	[ "$slice" = x86_64 ] || return 1
+	info="$(codesign -dv --arch "$slice" "$f" 2>&1 || true)"
+	grep -q 'not signed at all' <<< "$info"
 }
 
 # check verifies what Rune needs from the package, independently of how it was
 # built:
-#   1. Every Mach-O executable, library and bundle is signed, in every
-#      architecture slice, by the $TEAM_ID Developer ID (certificate chain up
-#      to Apple, not just the team string).
-#   2. lib/tree-sitter.so loads, for $TARGET_ARCH, into a process signed like
+#   1. lib/tree-sitter.so is signed, in every architecture slice, by the
+#      $TEAM_ID Developer ID (certificate chain up to Apple, not just the team
+#      string).
+#   2. Every Mach-O executable, library and bundle is intact in every slice:
+#      its load commands end before its code (see intact), and it has a valid
+#      signature. arm64 code must be signed or the kernel kills it; x86_64
+#      code may be unsigned, as upstream zig and zls are, but any signature
+#      it has must be valid.
+#   3. lib/tree-sitter.so loads, for $TARGET_ARCH, into a process signed like
 #      Rune.app, and <symbol> returns its language. A negative control first
 #      proves that the process enforces library validation, by requiring it
 #      to refuse an ad-hoc signed library. An x86_64 package is loaded under
 #      Rosetta on Apple silicon.
 check() {
-	local dir=$1 symbol=$2 devid rel f slice n=0 failed=0
+	local dir symbol=$2 so devid rel f slice n=0 broken=0 failed=0
+	# A hardened process refuses to dlopen a relative path.
+	dir="$(cd "$1" && pwd)" || die "$1 not found"
+	so=$dir/lib/tree-sitter.so
+	[ -f "$so" ] || die "$so not found"
 	devid="anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6]"
 	devid="$devid and certificate leaf[field.1.2.840.113635.100.6.1.13]"
 	devid="$devid and certificate leaf[subject.OU] = \"$TEAM_ID\""
+	for slice in $(lipo -archs "$so"); do
+		if ! codesign --verify --strict --arch "$slice" -R="$devid" "$so" 2> /dev/null; then
+			echo "error: lib/tree-sitter.so ($slice) is not signed with the $TEAM_ID Developer ID; Rune.app cannot load it" >&2
+			failed=1
+		fi
+	done
+	if [ "$failed" -eq 0 ]; then
+		echo "ok: tree-sitter.so is signed with the $TEAM_ID Developer ID"
+	fi
+
 	while IFS= read -r rel; do
 		n=$((n + 1))
 		f=$dir/$rel
 		for slice in $(lipo -archs "$f"); do
-			if ! codesign --verify --strict --arch "$slice" -R="$devid" "$f" 2> /dev/null; then
-				echo "error: $rel ($slice) is not signed with the $TEAM_ID Developer ID" >&2
-				failed=1
+			if ! intact "$f" "$slice"; then
+				echo "error: $rel ($slice) has load commands that run into its code; a post-link edit such as codesign overwrote it" >&2
+				broken=1
+			fi
+			if ! signed "$f" "$slice"; then
+				echo "error: $rel ($slice) has no valid code signature" >&2
+				broken=1
 			fi
 		done
 	done < <(files "$dir")
 	if [ "$n" -eq 0 ]; then
 		die "no Mach-O files in $dir"
 	fi
-	if [ "$failed" -eq 0 ]; then
-		echo "ok: $n Mach-O files are signed with the $TEAM_ID Developer ID"
+	if [ "$broken" -eq 0 ]; then
+		echo "ok: $n Mach-O files are intact and validly signed"
+	else
+		failed=1
 	fi
 	# Run the load test even after a signature failure: its error is the one
 	# Rune would show.
-	load "$dir/lib/tree-sitter.so" "$symbol" || failed=1
+	load "$so" "$symbol" || failed=1
 	[ "$failed" -eq 0 ]
 }
 
