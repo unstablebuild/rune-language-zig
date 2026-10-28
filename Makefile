@@ -151,8 +151,11 @@ package: $(TOOLCHAIN_STAMP) $(if $(filter linux,$(TARGET_OS)),$(HOST_ZIG))
 	# matching the fixtures under rune/internal/ide/syntax/syntaxtest.
 	cp tree-sitter-zig/queries/highlights.scm tree-sitter-zig/queries/indents.scm \
 		tree-sitter-zig/queries/locals.scm tree-sitter-zig/queries/folds.scm $(PKG)/lib
+	# debug.Tag is the version Rune shows when asking to run the extension;
+	# it matches the tag dist.sh uploads as.
 	cd rune && CGO_ENABLED=0 GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) \
-		go build -o $(CURDIR)/$(PKG)/bin/extension_zig ./cmd/extension_zig
+		go build -ldflags="-X unstable.build/rune/internal/debug.Tag=$(shell git describe --tags --dirty)" \
+		-o $(CURDIR)/$(PKG)/bin/extension_zig ./cmd/extension_zig
 	cp config.yaml $(PKG)
 
 # Developer ID-sign tree-sitter.so in a macOS package, the one file Rune loads
